@@ -109,6 +109,7 @@ def choose_model_type_in_model_config(model_config):
     function returns a ConfigDict with only the hyperparams associated with the model in
     model_config.type.
     """
+    print(model_config.keys())
     model_type = model_config.type
     model_config = model_config[model_type]
     model_config.type = model_type
@@ -165,6 +166,7 @@ def get_default_model_config() -> Dict:
     config = {
         "type": "ferminet",
         "ferminet": base_ferminet_config,
+        "ACEwf": base_ferminet_config, # use ferminet config for now
         "explicit_antisym": {
             "input_streams": input_streams,
             "backflow": ferminet_backflow,
