@@ -109,7 +109,6 @@ def choose_model_type_in_model_config(model_config):
     function returns a ConfigDict with only the hyperparams associated with the model in
     model_config.type.
     """
-    print(model_config.keys())
     model_type = model_config.type
     model_config = model_config[model_type]
     model_config.type = model_type
