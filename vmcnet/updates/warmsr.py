@@ -6,6 +6,7 @@ from kfac_jax import Optimizer as kfac_Optimizer
 from ml_collections import ConfigDict
 import chex
 import jax.numpy as jnp
+import optax
 
 import vmcnet.mcmc.position_amplitude_core as pacore
 import vmcnet.physics as physics
@@ -27,9 +28,10 @@ from vmcnet.utils.typing import (
     PRNGKey,
     PyTree,
     UpdateDataFn,
+    ModelApply
 )
 
-from .update_param_fns import UpdateParamFn, update_metrics_with_noclip
+from .update_param_fns import UpdateParamFn, update_metrics_with_noclip, make_traced_fn_with_single_metrics
 
 def construct_svd_update_param_fn(
     energy_and_statistics_fn,

@@ -87,8 +87,12 @@ def slog_psi_to_log_psi_apply(slog_psi_apply) -> Callable[..., Array]:
     """Get a log|psi| model apply callable from a sign(psi), log|psi| apply callable."""
 
     def log_psi_apply(*args) -> Array:
-        return slog_psi_apply(*args)[1]
-
+        out = slog_psi_apply(*args)
+        # ACEwf fix
+        if not isinstance(out, Tuple): 
+            return out
+        else:
+            return out[1]
     return log_psi_apply
 
 
@@ -115,12 +119,15 @@ def get_model_from_config(
 
 
     if model_config.type == "ACEwf":
+        mol = gto.Mole()
+        mol.atom = 'H 0 0 0.0'
+        mol.basis = 'cc-pvdz'
+        mol.spin = 1
+        mol.build()
+        print(mol)
         return ACEwf(
-            Nelec=10, 
-            spins=spin_split,
-            radial_basis_type="GTO",
-            max_n = 10,
-            max_l = 5,
+            mol=mol,
+            nu=2,
         )
 
     elif model_config.type == "ferminet":
@@ -993,9 +1000,7 @@ from pyscfad.gto import eval_gto
 class ACEPySCFOrbital(Module):
     mol: any
     def setup(self):
-        self.radial_basis = RadialBasis(mol=self.mol)
         self.Nelec = sum(self.mol.nelec)
-        self.num_basis = self.radial_basis.num_basis
         if self.Nelec % 2 == 0:
             self.spins = jnp.concatenate([jnp.zeros(self.Nelec // 2, dtype=jnp.int32),
                                           jnp.ones(self.Nelec // 2, dtype=jnp.int32)])
@@ -1003,13 +1008,14 @@ class ACEPySCFOrbital(Module):
             self.spins = jnp.concatenate([jnp.zeros(self.Nelec // 2 + 1, dtype=jnp.int32),
                                           jnp.ones(self.Nelec // 2, dtype=jnp.int32)])
         assert self.spins.shape[0] == sum(self.mol.nelec)
+        self.num_basis = len(self.mol.ao_labels())
     def get_nelec(self) -> int:
         return self.Nelec
     def get_spin(self) -> jnp.ndarray:
         return self.spins
     def get_num_basis(self) -> int:
         return self.num_basis
-    # TODO: confirm this can be evaluated in batch
+    # TODO: fix this
     def __call__(self, xyz: jnp.ndarray) -> jnp.ndarray:
         return self.mol.eval_gto("GTOval_sph", xyz)
     
@@ -1022,7 +1028,7 @@ class ACEwf(Module):
     dtype: jnp.dtype = jnp.float64
     def setup(self):
         self.Nelec = sum(self.mol.nelec)  
-        self.orbital = ACEOrbital(self.mol)
+        self.orbital = ACEPySCFOrbital(self.mol)
         self.spins = self.orbital.spins  
         self.num_basis = self.orbital.num_basis
         self.multi_idx = self._multiidx()
@@ -1030,19 +1036,45 @@ class ACEwf(Module):
         self.W = self.param("W", 
                     lambda rng, shape: jax.random.normal(rng, shape, dtype=self.dtype),
                     (self.Nelec, self.multi_idx_length))
+    # def _pooling(self, phi_nlm: jnp.ndarray) -> jnp.ndarray:
+    #     # Print shapes for debugging
+    #     print("phi_nlm shape:", phi_nlm.shape)
+        
+    #     # Create a spin mask to efficiently calculate Aall
+    #     spin_mask = jnp.stack([(self.spins == z).astype(jnp.float32) for z in range(2)], axis=0)  # Shape: (2, Nelec)
+    #     print("spin_mask shape:", spin_mask.shape)
+
+    #     # Compute Aall in a vectorized way (shape: (2, num_basis))
+    #     Aall = jnp.einsum('zi,ik->zk', spin_mask, phi_nlm)
+    #     print("Aall shape:", Aall.shape)
+
+    #     # Initialize A with zeros and set the third component directly
+    #     A = jnp.zeros((self.Nelec, 3, self.num_basis))
+    #     print("A shape:", A.shape)
+
+    #     # Set the third component directly
+    #     A = A.at[:, 2, :].set(phi_nlm)
+    #     print("A after setting third component:", A.shape)
+
+    #     # Efficient computation for the first two components
+    #     factor = spin_mask[:, :, None]  # Shape: (2, Nelec, 1)
+    #     diff = Aall[:, None, :] - factor * phi_nlm[None, :, :]  # Shape: (2, Nelec, num_basis)
+    #     A = A.at[:, :2, :].set(diff.transpose(1, 0, 2))
+
+    #     return A
     def _pooling(self, phi_nlm: jnp.ndarray) -> jnp.ndarray:
-        # Spin masks
-        spin_mask = jnp.stack([(self.spins == z).astype(jnp.float32) for z in range(2)], axis=0)
-        # Compute Aall in a vectorized way
-        Aall = jnp.einsum('i,ik->zk', spin_mask, phi_nlm)
-        # Use broadcasting to compute the factor in a vectorized way
-        factor = spin_mask[:, :, None]  # Shape: (2, Nelec, 1)
-        # Vectorized calculation of A
         A = jnp.zeros((self.Nelec, 3, self.num_basis))
-        A = A.at[:, 2, :].set(phi_nlm)
-        # Efficient calculation of the remaining elements
-        diff = Aall[:, None, :] - factor * phi_nlm[None, :, :]
-        A = A.at[:, :2, :].set(diff.transpose(1, 0, 2))
+        Aall = jnp.zeros((2, self.num_basis))
+        for k in range(self.num_basis):
+            for i in range(self.Nelec):
+                iσ = self.spins[i]
+                Aall = Aall.at[iσ, k].add(phi_nlm[i, k])
+                A = A.at[i, 2, k].set(phi_nlm[i, k])
+        for k in range(self.num_basis): 
+            for z in range(2):
+                for i in range(self.Nelec): 
+                    factor = 1 if self.spins[i] == z else 0
+                    A = A.at[i, z, k].set(Aall[z, k] - factor * phi_nlm[i, k])
         return A
     def _idx(self) -> list:
         """
