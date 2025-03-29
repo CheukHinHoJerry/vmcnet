@@ -219,6 +219,8 @@ def create_value_and_grad_energy_fn(
         energy, local_energies, stats = get_clipped_energies_and_stats(
             local_energies_noclip, nchains, clipping_fn, nan_safe
         )
+        if len(local_energies.shape)==2:
+            local_energies = local_energies[:,0]
         centered_local_energies = local_energies - energy
         grad_E = jax.grad(standard_estimator_forward, argnums=0)(
             params, positions, centered_local_energies

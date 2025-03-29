@@ -42,7 +42,7 @@ def create_laplacian_kinetic_energy(
         n = flat_x.shape[0]
         eye = jnp.eye(n)
 
-        def flattened_log_psi(flat_x_in):
+        def flattened_log_psi(flat_x_in: Array) -> Array:
             """Flattened input to flattened output version of log_psi."""
             return log_psi_apply(params, jnp.reshape(flat_x_in, x_shape))
 

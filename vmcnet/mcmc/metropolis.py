@@ -104,14 +104,15 @@ def walk_data(
         (jnp.chex.Numeric, pytree-like, PRNGKey): acceptance probability, new data,
             new jax PRNG key split (possibly multiple times) from previous one
     """
-
-    def step_fn(carry, x):
+    def step_fn(carry: Tuple[P, PRNGKey], x: any) -> Tuple[chex.Numeric, D, PRNGKey]:
         del x
         accept_prob, data, key = metrop_step_fn(params, carry[1], carry[2])
-        return (carry[0] + accept_prob, data, key), None
+        return (carry[0] + accept_prob, data, key)
 
-    out = jax.lax.scan(step_fn, (0.0, data, key), xs=None, length=nsteps)
-    accept_sum, data, key = out[0]
+    accept_sum, data, key = 0.0, data, key
+    for _ in range(nsteps):
+        accept_sum, data, key = step_fn((accept_sum, data, key), None)
+
     return accept_sum / nsteps, data, key
 
 
@@ -145,8 +146,11 @@ def make_jitted_burning_step(
         _, data, key = metrop_step_fn(params, data, key)
         return data, key
 
+    # TODO: fix this
     if not apply_pmap:
         return jax.jit(burning_step)
+        #print("not jitted burn in")
+        #return burning_step #jax.jit(burning_step)
 
     return utils.distribute.pmap(burning_step)
 
@@ -186,6 +190,8 @@ def make_jitted_walker_fn(
 
     if not apply_pmap:
         return jax.jit(walker_fn)
+        #print("not jitted walker fn")
+        #return walker_fn
 
     pmapped_walker_fn = utils.distribute.pmap(walker_fn)
 
@@ -222,7 +228,9 @@ def burn_data(
         (pytree-like, PRNGKey): new data, new key
     """
     logging.info("Burning data for %d steps", nsteps_to_burn)
-    for _ in range(nsteps_to_burn):
+    for i in range(nsteps_to_burn):
+        if i % 100 == 0:
+            print(i)
         data, key = burning_step(params, data, key)
     return data, key
 

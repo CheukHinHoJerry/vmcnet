@@ -13,6 +13,10 @@ from ml_collections import ConfigDict
 import jax
 import jax.numpy as jnp
 
+from pyscfad import gto
+from pyscfad.gto import eval_gto
+
+
 from vmcnet.utils.slog_helpers import slog_sum_over_axis
 from vmcnet.utils.typing import (
     Array,
@@ -33,6 +37,7 @@ from .core import (
     AddedModel,
     SimpleResNet,
     Module,
+    Dense,
     get_nelec_per_split,
     get_nsplits,
     get_spin_split,
@@ -87,6 +92,7 @@ def slog_psi_to_log_psi_apply(slog_psi_apply) -> Callable[..., Array]:
     """Get a log|psi| model apply callable from a sign(psi), log|psi| apply callable."""
 
     def log_psi_apply(*args) -> Array:
+        print("Calling log psi_apply")
         out = slog_psi_apply(*args)
         # ACEwf fix
         if not isinstance(out, Tuple): 
@@ -119,15 +125,28 @@ def get_model_from_config(
 
 
     if model_config.type == "ACEwf":
-        mol = gto.Mole()
-        mol.atom = 'H 0 0 0.0'
-        mol.basis = 'cc-pvdz'
-        mol.spin = 1
-        mol.build()
-        print(mol)
+        print("spin split", spin_split)
         return ACEwf(
-            mol=mol,
+            mol=None,
             nu=2,
+            nelec=14,
+            compute_input_streams=compute_input_streams,
+            orbital_type="ACEOrbital",
+            kernel_initializer_orbital_linear=kernel_init_constructor(
+                model_config.kernel_init_orbital_linear
+            ),
+            kernel_initializer_envelope_dim=kernel_init_constructor(
+                model_config.kernel_init_envelope_dim
+            ),
+            kernel_initializer_envelope_ion=kernel_init_constructor(
+                model_config.kernel_init_envelope_ion
+            ),
+            envelope_softening=model_config.envelope_softening,
+            bias_initializer_orbital_linear=bias_init_constructor(
+                model_config.bias_init_orbital_linear
+            ),
+            orbitals_use_bias=model_config.orbitals_use_bias,
+            isotropic_decay=model_config.isotropic_decay,
         )
 
     elif model_config.type == "ferminet":
@@ -652,6 +671,8 @@ class FermiNet(Module):
 
         # slog_det_prods is SLArray of shape (ndeterminants, ...)
         slog_det_prods = slogdet_product(orbitals)
+        #print(slog_sum_over_axis(slog_det_prods))
+        #print("slog_sum_over_axis(slog_det_prods).shape : ", slog_sum_over_axis(slog_det_prods))
         return slog_sum_over_axis(slog_det_prods)
 
 
@@ -902,100 +923,133 @@ class GenericAntisymmetry(Module):
         return sign_psi, log_antisym + jastrow_part
     
 # ==== ACEorbital layer ====
+from flax.linen import Module
+from functools import partial
+from jax import jit, vmap
+import jax.numpy as jnp
 
-# class RadialBasis(Module):
-#     basis_type: str
+@jit
+def bessel_jv_jit(v, x, terms=50):
+    x_over_2 = x / 2.0
+    x_over_2_v = x_over_2 ** v
 
-#     def setup(self):
-#         # Dummy num_basis based on the basis type (you can adjust as needed)
-#         self.num_basis = 10 if self.basis_type == "GTO" else 5
-#         self.index_list = jnp.array([123])
+    def term_fn(k, val):
+        k_float = jax.lax.convert_element_type(k, x.dtype) + 1
+        numerator = (-1) ** k * x_over_2 ** (2 * k)
+        denominator = jax.lax.exp(jax.lax.lgamma(k_float) + jax.lax.lgamma(k_float + v))
+        term = numerator / denominator
+        return val + term
 
-#     def get_all_idx(self) -> jnp.ndarray:
-#         return self.index_list
+    result = jax.lax.fori_loop(0, terms, term_fn, 0.0)
+    return result * x_over_2_v
 
-#     def __call__(self, elec_pos_norm: jnp.ndarray) -> jnp.ndarray:
-#         Nelec = elec_pos_norm.shape[0]
-#         return jnp.zeros((Nelec, self.num_basis))  # shape (Nelec, num_basis)
-    
-# import sphericart.jax
-# import jax
 
-# class SphericalBasis(Module):
-#     max_l: int
+@jit
+def sphj_bessel(n, x):
+    return jnp.sqrt(jnp.pi / (2 * x)) * bessel_jv_jit(n + 0.5, x)
 
-#     def setup(self):
-#         # Precompute indices of (l, m)
-#         self.ij_m = [(jnp.arange(-l, l + 1)) for l in range(self.max_l + 1)]
-#         self.ij_l = [
-#             jnp.repeat(jnp.array([l]), 2 * l + 1) for l in range(self.max_l + 1)
-#         ]
-#         self.idx = jnp.concatenate(
-#             [
-#                 jnp.stack([self.ij_l[l], self.ij_m[l]], axis=1)
-#                 for l in range(self.max_l + 1)
-#             ],
-#             axis=0,
-#         )
-#         # Sphericart's spherical harmonics (jitted for efficiency)
-#         self.jitted_sph_function = jax.jit(
-#             sphericart.jax.spherical_harmonics, static_argnums=(1,)
-#         )
 
-#     def get_ids(self) -> jnp.ndarray:
-#         """
-#         Returns an array of shape [total, 2] containing (l, m).
-#         """
-#         return self.idx
+@jit
+def multiple_sphj_bessel(nus: jnp.ndarray, x: float) -> jnp.ndarray:
+    return jnp.sqrt(jnp.pi / (2 * x)) * vmap(bessel_jv_jit, in_axes=(0, None))(nus + 0.5, x)
 
-#     def _compute_spherical_harmonics(self, xyz: jnp.ndarray) -> jnp.ndarray:
-#         """
-#         xyz shape: [N, 3].
-#         returns shape [N, (max_l+1)^2]
-#         """
-#         return self.jitted_sph_function(xyz, self.max_l)
 
-#     def __call__(self, xyz: jnp.ndarray) -> jnp.ndarray:
-#         # Add a small shift in radius to avoid division by zero inside spherical harmonics
-#         return self._compute_spherical_harmonics(xyz)
+@jit
+def radial_polynomial(r: float, nus: jnp.ndarray) -> jnp.ndarray:
+    return jnp.abs(multiple_sphj_bessel(nus, r))
 
-#     def __repr__(self) -> str:
-#         return f"SphericalBasis(max_l={self.max_l})"
 
-# class ACEOrbital(Module):
-#     Nelec: int
-#     spins: int
-#     radial_basis_type: str
-#     max_n: int
-#     max_l: int
+class RadialBasis(Module):
+    max_n: int
+    def setup(self):
+        # Create an array of indices [0, 1, ..., max_n]
+        self.nus = jnp.arange(self.max_n + 1)
 
-#     def setup(self):
-#         self.radial_basis = RadialBasis(basis_type=self.radial_basis_type)
-#         #self.spherical_basis = SphericalBasis(max_l=self.max_l)
-#         self.spins = jnp.zeros(self.Nelec)
-#         assert len(self.spins) == self.Nelec
-
-#     def __call__(self, elec_pos: jnp.ndarray) -> jnp.ndarray:
-#         # radial distance along the R^3 dimension
-#         r = jnp.linalg.norm(elec_pos, axis=-1)
+    def __call__(self, r: jnp.ndarray) -> jnp.ndarray:
+        # r: [N] — normed distances
+        # Apply radial_polynomial(r_i, self.nus) for each r_i
+        return vmap(partial(radial_polynomial, nus=self.nus))(r)  # shape [N, max_n + 1]
         
-#         # avoid zero
-#         r = jnp.where(r < 1e-9, 1e-9, r)
+import sphericart.jax
+import jax
 
-#         # Evaluate radial polynomial
-#         r_basis_poly = self.radial_basis(r)  # shape [Nelec, max_n]
+class SphericalBasis(Module):
+    max_l: int
+    def setup(self):
+        # Precompute indices of (l, m)
+        self.ij_m = [(jnp.arange(-l, l + 1)) for l in range(self.max_l + 1)]
+        self.ij_l = [
+            jnp.repeat(jnp.array([l]), 2 * l + 1) for l in range(self.max_l + 1)
+        ]
+        self.idx = jnp.concatenate(
+            [
+                jnp.stack([self.ij_l[l], self.ij_m[l]], axis=1)
+                for l in range(self.max_l + 1)
+            ],
+            axis=0,
+        )
+        # Sphericart's spherical harmonics (jitted for efficiency)
+        self.jitted_sph_function = jax.jit(
+            sphericart.jax.spherical_harmonics, static_argnums=(1,)
+        )
 
-#         # spherical part
-#         sphs = self.spherical_basis(elec_pos)  # shape [Nelec, (max_l+1)^2]
+    def get_ids(self) -> jnp.ndarray:
+        """
+        Returns an array of shape [total, 2] containing (l, m).
+        """
+        return self.idx
 
-#         # outer product
-#         phi_out = jnp.einsum("ni,nj->nij", r_basis_poly, sphs)  # shape [Nelec, max_n, (max_l+1)^2]
-#         return phi_out
+    def _compute_spherical_harmonics(self, xyz: jnp.ndarray) -> jnp.ndarray:
+        """
+        xyz shape: [N, 3].
+        returns shape [N, (max_l+1)^2]
+        """
+        return self.jitted_sph_function(xyz, self.max_l)
+
+    def __call__(self, xyz: jnp.ndarray) -> jnp.ndarray:
+        # Add a small shift in radius to avoid division by zero inside spherical harmonics
+        return self._compute_spherical_harmonics(xyz)
+
+    def __repr__(self) -> str:
+        return f"SphericalBasis(max_l={self.max_l})"
+
+class ACEOrbital(Module):
+    max_n: int
+    max_l: int
+    max_k: int
+    def setup(self):
+        self.radial_basis = RadialBasis(max_n=self.max_n)
+        self.spherical_basis = SphericalBasis(max_l=self.max_l)
+        self.Wdense = Dense(self.max_k)
+        self.features=self.max_k
+    def __call__(self, elec_pos: jnp.ndarray) -> jnp.ndarray:
+        batch, Nelec, _ = elec_pos.shape
+        flat_elec_pos = elec_pos.reshape(-1, 3)  # shape [batch * Nelec, 3]
+
+        # Compute norm and avoid zero
+        r = jnp.linalg.norm(flat_elec_pos, axis=-1)  # [batch * Nelec]
+        r = jnp.where(r < 1e-9, 1e-9, r)
+
+        # Evaluate basis functions
+        r_basis_poly = self.radial_basis(r)        # [batch * Nelec, max_n]
+        print(r_basis_poly.shape)
+        sphs = self.spherical_basis(flat_elec_pos) # [batch * Nelec, (max_l+1)^2]
+
+        # Outer product
+        phi = jnp.einsum("ni,nj->nij", r_basis_poly, sphs)  # [batch * Nelec, max_n, (max_l+1)^2]
+
+        # Reshape back to [batch, Nelec, ...]
+        phi = phi.reshape(batch, Nelec, r_basis_poly.shape[1], sphs.shape[1])  # [batch, Nelec, max_n, (max_l+1)^2]
+
+        # Flatten final feature dimension
+        phi_flat = phi.reshape(batch, Nelec, -1)  # [batch, Nelec, nbasis]
+        # compress the feature dimension
+        return self.Wdense(phi_flat)
+
 
 import jax
 import jax.numpy as jnp
-from pyscfad import gto
-from pyscfad.gto import eval_gto
+from functools import partial
 
 class ACEPySCFOrbital(Module):
     mol: any
@@ -1015,66 +1069,88 @@ class ACEPySCFOrbital(Module):
         return self.spins
     def get_num_basis(self) -> int:
         return self.num_basis
-    # TODO: fix this
     def __call__(self, xyz: jnp.ndarray) -> jnp.ndarray:
-        return self.mol.eval_gto("GTOval_sph", xyz)
+        if len(xyz.shape) == 2:
+            xyz = xyz.reshape(1, xyz.shape[0], xyz.shape[1])
+        Nsamples = xyz.shape[0] 
+        phi_nlm = jnp.zeros((Nsamples, self.Nelec, self.num_basis))
+        for n in range(Nsamples):
+            phi_nlm = phi_nlm.at[n, :, :].set(self.mol.eval_gto("GTOval", xyz[n, :, :]))
+        return phi_nlm
+
     
 # ==== ACE wavefunction ====
 from itertools import chain, product
 
 class ACEwf(Module):
     mol: any
+    nelec: int
+    compute_input_streams: ComputeInputStreams
+    kernel_initializer_orbital_linear: WeightInitializer
+    kernel_initializer_envelope_dim: WeightInitializer
+    kernel_initializer_envelope_ion: WeightInitializer
+    envelope_softening: chex.Scalar
+    bias_initializer_orbital_linear: WeightInitializer
+    orbitals_use_bias: bool
+    isotropic_decay: bool
     nu: int = 2
-    dtype: jnp.dtype = jnp.float64
+    dtype: jnp.dtype = jnp.float32
+    orbital_type: str = "FerminetOrbital"
+
     def setup(self):
-        self.Nelec = sum(self.mol.nelec)  
-        self.orbital = ACEPySCFOrbital(self.mol)
-        self.spins = self.orbital.spins  
-        self.num_basis = self.orbital.num_basis
+        self.Nelec = self.nelec
+        if self.orbital_type == "ACEPySCFOrbital": 
+            self.orbital = ACEPySCFOrbital(self.mol)
+        elif self.orbital_type == "ACEOrbital":
+            self.orbital = ACEOrbital(max_n=10, max_l=3, max_k=20)
+        elif self.orbital_type == "FerminetOrbital":
+            self.orbital = Dense(
+                10,
+                kernel_init=self.kernel_initializer_orbital_linear,
+                bias_init=self.bias_initializer_orbital_linear,
+                use_bias=self.orbitals_use_bias,
+            )
+            # FermiNetOrbitalLayer(
+            #     orbitals_split=(self.Nelec, ),
+            #     norbitals_per_split=(self.Nelec, ),
+            #     kernel_initializer_linear=self.kernel_initializer_orbital_linear,
+            #     kernel_initializer_envelope_dim=self.kernel_initializer_envelope_dim,
+            #     kernel_initializer_envelope_ion=self.kernel_initializer_envelope_ion,
+            #     bias_initializer_linear=self.bias_initializer_orbital_linear,
+            #     envelope_softening=self.envelope_softening,
+            #     use_bias=self.orbitals_use_bias,
+            #     isotropic_decay=self.isotropic_decay,
+            # )
+
+        self.spins = jnp.concatenate([jnp.zeros(7, dtype=jnp.int32),
+                                          jnp.ones(7, dtype=jnp.int32)])
+        
+        self.num_basis = self.orbital.features
         self.multi_idx = self._multiidx()
         self.multi_idx_length = len(self.multi_idx)
-        self.W = self.param("W", 
-                    lambda rng, shape: jax.random.normal(rng, shape, dtype=self.dtype),
-                    (self.Nelec, self.multi_idx_length))
-    # def _pooling(self, phi_nlm: jnp.ndarray) -> jnp.ndarray:
-    #     # Print shapes for debugging
-    #     print("phi_nlm shape:", phi_nlm.shape)
-        
-    #     # Create a spin mask to efficiently calculate Aall
-    #     spin_mask = jnp.stack([(self.spins == z).astype(jnp.float32) for z in range(2)], axis=0)  # Shape: (2, Nelec)
-    #     print("spin_mask shape:", spin_mask.shape)
-
-    #     # Compute Aall in a vectorized way (shape: (2, num_basis))
-    #     Aall = jnp.einsum('zi,ik->zk', spin_mask, phi_nlm)
-    #     print("Aall shape:", Aall.shape)
-
-    #     # Initialize A with zeros and set the third component directly
-    #     A = jnp.zeros((self.Nelec, 3, self.num_basis))
-    #     print("A shape:", A.shape)
-
-    #     # Set the third component directly
-    #     A = A.at[:, 2, :].set(phi_nlm)
-    #     print("A after setting third component:", A.shape)
-
-    #     # Efficient computation for the first two components
-    #     factor = spin_mask[:, :, None]  # Shape: (2, Nelec, 1)
-    #     diff = Aall[:, None, :] - factor * phi_nlm[None, :, :]  # Shape: (2, Nelec, num_basis)
-    #     A = A.at[:, :2, :].set(diff.transpose(1, 0, 2))
-
-    #     return A
+        # self.W = self.param("W", 
+        #             lambda rng, shape: jax.random.normal(rng, shape, dtype=self.dtype),
+        #             (self.Nelec, self.multi_idx_length))
+        self.W_dense =  Dense(
+                self.Nelec,
+                kernel_init=self.kernel_initializer_orbital_linear,
+                bias_init=self.bias_initializer_orbital_linear,
+                use_bias=True,
+            )
     def _pooling(self, phi_nlm: jnp.ndarray) -> jnp.ndarray:
-        A = jnp.zeros((self.Nelec, 3, self.num_basis))
-        Aall = jnp.zeros((2, self.num_basis))
-        for k in range(self.num_basis):
-            for i in range(self.Nelec):
-                iσ = self.spins[i]
-                Aall = Aall.at[iσ, k].add(phi_nlm[i, k])
-                A = A.at[i, 2, k].set(phi_nlm[i, k])
-        for k in range(self.num_basis): 
-            for z in range(2):
-                for i in range(self.Nelec): 
-                    factor = 1 if self.spins[i] == z else 0
-                    A = A.at[i, z, k].set(Aall[z, k] - factor * phi_nlm[i, k])
+        Nsamples = phi_nlm.shape[0]
+        A = jnp.zeros((Nsamples, self.Nelec, 3, self.num_basis))
+        Aall = jnp.zeros((Nsamples, 2, self.num_basis))
+        for n in range(Nsamples):
+            for k in range(self.num_basis):
+                for i in range(self.Nelec):
+                    iσ = self.spins[i]
+                    Aall = Aall.at[n, iσ, k].add(phi_nlm[n, i, k])
+                    A = A.at[n, i, 2, k].set(phi_nlm[n, i, k])
+            for k in range(self.num_basis): 
+                for z in range(2):
+                    for i in range(self.Nelec): 
+                        A = A.at[n, i, z, k].set(Aall[n, z, k] - (self.spins[i] == z) * phi_nlm[n, i, k])
         return A
     def _idx(self) -> list:
         """
@@ -1097,21 +1173,40 @@ class ACEwf(Module):
         return len(self._multiidx())
     # TODO: implement this more carefully
     def _corr(self, pooled_A: jnp.ndarray, multi_idx: list) -> jnp.ndarray:
-        # pooled_A shape: (Nelec, 3, num_1pbasis)
+        Nsamples = pooled_A.shape[0]
+        # pooled_A shape: (Nsamples, Nelec, 3, num_1pbasis)
         num_multibasis = len(multi_idx)
-        corrA = jnp.ones((self.Nelec, num_multibasis))
-        for i in range(num_multibasis):
-            terms = jnp.stack([pooled_A[:, a, b] for (a, b) in multi_idx[i]], axis=0)
-            corrA = corrA.at[:, i].set(jnp.prod(terms, axis=0))
+        corrA = jnp.ones((Nsamples, self.Nelec, num_multibasis))
+        for n in range(Nsamples):
+            for i in range(num_multibasis):
+                terms = jnp.stack([pooled_A[n, :, a, b] for (a, b) in multi_idx[i]], axis=0)
+                corrA = corrA.at[n, :, i].set(jnp.prod(terms, axis=0))
         return corrA
     def _mask(self, A) -> jnp.ndarray:
         A_bool = self.spins[:, None] == self.spins[None, :]
+        A_bool = A_bool.reshape(1, self.Nelec, self.Nelec)
         return A * A_bool.astype(self.dtype)
+    
+    @flax.linen.compact
     def __call__(self, xyz: jnp.ndarray):
+        if len(xyz.shape) == 2:
+            xyz = xyz.reshape(1, xyz.shape[0], xyz.shape[1])
+        input_stream_1e, input_stream_2e, r_ei, _ = self.compute_input_streams(
+            xyz
+        )
+        #print(input_stream_1e.shape)
+        #print("shape of xyz :", xyz.shape)
         phinlm = self.orbital(xyz)
+        #print("shape of phinlm :", phinlm.shape)
         pool_A = self._pooling(phinlm)
+        #print("shape of pool_A :", pool_A.shape)
         corr_A = self._corr(pool_A, self.multi_idx)
-        Mat = jnp.einsum('ik,jk->ij', self.W, corr_A)
+        #print("shape of corr_A :", corr_A.shape)
+        #Mat = jnp.einsum('ik,bjk->bij', self.W, corr_A)
+        Mat = self.W_dense(corr_A)
+        #print("shape of Mat :", Mat.shape)
         Mat_spin = self._mask(Mat)
         # this should be logged too? to check
+        #print("Done eval")
+        #print("jnp.linalg.det(Mat_spin): ", jnp.linalg.det(Mat_spin).shape)
         return jnp.linalg.det(Mat_spin)
