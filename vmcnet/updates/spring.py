@@ -91,6 +91,7 @@ def initialize_spring(
         return optimizer_state[0].trace
 
     def optimizer_apply(energy, local_energies, params, optimizer_state, data):
+        local_energies= local_energies.reshape(-1)
         centered_local_energies = local_energies - energy
         grad = spring_step(
             centered_local_energies,
@@ -98,7 +99,6 @@ def initialize_spring(
             prev_update(optimizer_state),
             get_position_fn(data),
         )
-
         updates, optimizer_state = descent_optimizer.update(
             grad, optimizer_state, params
         )
@@ -144,7 +144,6 @@ def get_spring_step(
         nchains = positions.shape[0]
         mu_prev = jax.tree_map(lambda x: mu * x, prev_grad)
         ones = jnp.ones((nchains, 1))
-
         # Calculate T = Ohat @ Ohat^T using neural-tangents
         # Some GPUs, particularly A100s and A5000s, can exhibit large numerical
         # errors in these calculations. As a result, we explicitly symmetrize T

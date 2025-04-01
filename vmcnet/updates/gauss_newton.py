@@ -86,6 +86,7 @@ def initialize_gauss_newton(
     )
 
     def optimizer_apply(local_energies, params, optimizer_state, data):
+        local_energies= local_energies.reshape(-1)
         grad = gauss_newton_step(
             local_energies,
             params,
