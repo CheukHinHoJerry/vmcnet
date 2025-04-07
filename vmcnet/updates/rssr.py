@@ -104,6 +104,7 @@ def initialize_rssr(
         log_psi_apply,
         optimizer_config.damping,
         optimizer_config.mu,
+        optimizer_config.srft_rank,
     )
 
     descent_optimizer = optax.sgd(

@@ -106,6 +106,7 @@ def initialize_warmsr(
             log_psi_apply,
             optimizer_config.damping,
             optimizer_config.mu,
+            optimizer_config.srft_rank,
         )
 
         descent_optimizer = optax.sgd(
@@ -168,8 +169,6 @@ def initialize_warmsr(
                         prev_X=None,
                         )
         return update_param_fn, optimizer_state
-
-
 
 def get_svd_step(
     log_psi_apply: ModelApply[P],
