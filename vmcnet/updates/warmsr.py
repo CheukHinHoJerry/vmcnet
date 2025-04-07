@@ -37,6 +37,13 @@ from .update_param_fns import UpdateParamFn, update_metrics_with_noclip, make_tr
 from .optax_utils import initialize_optax_optimizer
 from typing import NamedTuple
 
+from sklearn.utils.extmath import randomized_svd
+import math
+import jax
+import jax.numpy as jnp
+from jax.flatten_util import ravel_pytree
+import chex
+from typing import Tuple, Optional
 
 class WarmSROptimizerState(NamedTuple):
     opt_state: optax.OptState
@@ -162,19 +169,6 @@ def initialize_warmsr(
                         )
         return update_param_fn, optimizer_state
 
-from sklearn.utils.extmath import randomized_svd
-import math
-import jax
-import jax.numpy as jnp
-from jax.flatten_util import ravel_pytree
-import chex
-from typing import Tuple, Optional
-
-import jax
-import jax.numpy as jnp
-from jax.flatten_util import ravel_pytree
-import chex
-from typing import Tuple, Optional
 
 
 def get_svd_step(
@@ -258,46 +252,55 @@ def get_svd_step(
 
     return svd_step
 
+# ==== SVD implementations =====
 
-import numpy as np
+def ssi(A, X, Y, maxit, k=3):
+    def body_fn(i, carry):
+        X, Y = carry
+        X = A @ Y
+        X = jax.lax.cond(
+            (i % k == 0) | (i == maxit),
+            lambda x: jnp.linalg.qr(x, mode='reduced')[0],
+            lambda x: x,
+            X,
+        )
+        Y = A.T @ X
+        return X, Y
 
-def SSI(A, X, Y, maxit, k=3):
-    for iter in range(1, maxit + 1):
-        X = np.dot(A, Y)
-        if iter % k == 0 or iter == maxit:
-            Q, _ = np.linalg.qr(X, mode='reduced')
-            X = Q
-        Y = np.dot(A.T, X)
+    X, Y = jax.lax.fori_loop(1, maxit + 1, body_fn, (X, Y))
     return X, Y
 
 def ssisvd(A, r, X=None, maxit=10):
     m, n = A.shape
+    l = min(2 * r, r + 10, m, n)
+
     if X is None:
-        l = min(2 * r, r + 10, m, n)
-        Y = np.random.randn(n, l)
-        X = np.dot(A, Y)
+        key = jax.random.PRNGKey(42)  # replace with a real key if needed
+        Y = jax.random.normal(key, (n, l))
+        X = A @ Y
     else:
         if X.shape[1] < r:
-            extra = np.random.randn(X.shape[0], r - X.shape[1])
-            X = np.hstack([X, extra])
-        Y = np.dot(A.T, X)
-        X = np.dot(A, Y)
-    Q, _ = np.linalg.qr(X, mode='reduced')
-    Y = np.dot(A.T, Q)
+            extra_dim = r - X.shape[1]
+            key = jax.random.PRNGKey(123)  # again, use a real key
+            extra = jax.random.normal(key, (X.shape[0], extra_dim))
+            X = jnp.hstack([X, extra])
+        Y = A.T @ X
+        X = A @ Y
 
-    X, Y = SSI(A, X, Y, maxit)
+    Q, _ = jnp.linalg.qr(X, mode='reduced')
+    Y = A.T @ Q
+    X, Y = ssi(A, Q, Y, maxit)
 
-    QY, R = np.linalg.qr(Y, mode='reduced')
-    r_diag = np.diag(R)
-    sign_R = np.sign(r_diag)
-    r_diag = np.abs(r_diag)
-    sorted_indices = np.argsort(r_diag)[::-1][:r]
+    QY, R = jnp.linalg.qr(Y, mode='reduced')
+    r_diag = jnp.diag(R)
+    sign_R = jnp.sign(r_diag)
+    r_diag_abs = jnp.abs(r_diag)
+    sorted_indices = jnp.argsort(r_diag_abs)[::-1][:r]
 
-    X = X * sign_R[np.newaxis, :]
-
-    U = X[:, sorted_indices].copy()
-    S = r_diag[sorted_indices].copy()
-    V = QY[:, sorted_indices].copy()
+    X = X * sign_R[jnp.newaxis, :]
+    U = X[:, sorted_indices]
+    S = r_diag_abs[sorted_indices]
+    V = QY[:, sorted_indices]
 
     return U, S, V, X
 
