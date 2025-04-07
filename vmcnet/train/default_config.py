@@ -240,6 +240,17 @@ def get_default_vmc_config() -> Dict:
         "nan_safe": True,
         "optimizer_type": "spring",
         "optimizer": {
+            "warmsr": {
+                # Learning rate settings
+                "schedule_type": "inverse_time",  # constant or inverse_time
+                "learning_rate": 5e-2,  # needs to be tuned with everything else
+                "learning_decay_rate": 1e-4,
+                # SPRING hyperparams
+                "mu": 0.99,
+                "damping": 0.001,
+                "constrain_norm": True,
+                "norm_constraint": 0.001,
+            },
             "kfac": {
                 "l2_reg": 0.0,
                 "norm_constraint": 0.001,

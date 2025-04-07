@@ -1,4 +1,4 @@
-from typing import Tuple
+from typing import Tuple, Dict
 
 import jax
 import kfac_jax
@@ -7,6 +7,7 @@ from ml_collections import ConfigDict
 import chex
 import jax.numpy as jnp
 import optax
+import neural_tangents as nt  # type: ignore
 
 import vmcnet.mcmc.position_amplitude_core as pacore
 import vmcnet.physics as physics
@@ -25,6 +26,7 @@ from vmcnet.utils.typing import (
     LearningRateSchedule,
     OptimizerState,
     P,
+    S,
     PRNGKey,
     PyTree,
     UpdateDataFn,
@@ -32,9 +34,20 @@ from vmcnet.utils.typing import (
 )
 
 from .update_param_fns import UpdateParamFn, update_metrics_with_noclip, make_traced_fn_with_single_metrics
+from .optax_utils import initialize_optax_optimizer
+from typing import NamedTuple
+
+
+class WarmSROptimizerState(NamedTuple):
+    opt_state: optax.OptState
+    prev_eloc: Array
+    prev_O: Array
+    prev_U: Array
+    prev_X: Array
+
 
 def construct_svd_update_param_fn(
-    energy_and_statistics_fn,
+    energy_data_val_and_grad,
     optimizer_apply: Callable[[P, P, S, D, Dict[str, Array]], Tuple[P, S]],
     get_position_fn: GetPositionFromData[D],
     update_data_fn: UpdateDataFn[D, P],
@@ -45,13 +58,11 @@ def construct_svd_update_param_fn(
 
     def update_param_fn(params, data, optimizer_state, key):
         position = get_position_fn(data)
-
-        energy, local_energies, stats = energy_and_statistics_fn(params, position)
-
+        energy, centered_local_energies, stats, params_grad = energy_data_val_and_grad(params, position)
         params, optimizer_state = optimizer_apply(
-            energy,
-            local_energies,
+            centered_local_energies,
             params,
+            params_grad,
             optimizer_state,
             data,
         )
@@ -71,9 +82,10 @@ def construct_svd_update_param_fn(
 
     return traced_fn
 
-def initialize_svd(
+def initialize_warmsr(
         log_psi_apply: ModelApply[P],
         energy_and_statistics_fn,
+        energy_data_val_and_grad,
         params: P,
         get_position_fn: GetPositionFromData[D],
         update_data_fn: UpdateDataFn[D, P],
@@ -83,7 +95,7 @@ def initialize_svd(
         apply_pmap: bool = True,
     ) -> Tuple[UpdateParamFn[P, D, optax.OptState], optax.OptState]:
         """Get an update param function and initial state for SVD."""
-        spring_step = get_svd_step(
+        warmsr_step = get_svd_step(
             log_psi_apply,
             optimizer_config.damping,
             optimizer_config.mu,
@@ -93,18 +105,22 @@ def initialize_svd(
             learning_rate=learning_rate_schedule, momentum=0, nesterov=False
         )
 
-        def optimizer_apply(energy, local_energies, params, optimizer_state, data):
-            centered_local_energies = local_energies - energy
-            grad = svd_step(
+        def optimizer_apply(centered_local_energies, params, params_grad, optimizer_state, data):
+            # local_energies = local_energies.reshape(-1)
+            # centered_local_energies = local_energies - energy
+
+            grad, _, new_prev_eloc, new_prev_O, new_prev_U, new_prev_X = warmsr_step(
                 centered_local_energies,
-                prev_eloc,
-                prev_O,
-                prev_update(optimizer_state),
+                params,
+                params_grad,
+                optimizer_state.prev_eloc,
+                optimizer_state.prev_O,
+                optimizer_state.prev_X,
                 get_position_fn(data),
             )
 
-            updates, optimizer_state = descent_optimizer.update(
-                grad, optimizer_state, params
+            updates, new_opt_state = descent_optimizer.update(
+                grad, optimizer_state.opt_state, params
             )
 
             if optimizer_config.constrain_norm:
@@ -114,70 +130,131 @@ def initialize_svd(
                 )
 
             params = optax.apply_updates(params, updates)
-            return params, optimizer_state
+
+
+            new_state = WarmSROptimizerState(
+                opt_state=new_opt_state,
+                prev_eloc=new_prev_eloc,
+                prev_O=new_prev_O,
+                prev_U=new_prev_U,
+                prev_X=new_prev_X,
+            )
+
+            return params, new_state
+
 
         update_param_fn = construct_svd_update_param_fn(
-            energy_and_statistics_fn,
+            energy_data_val_and_grad,
             optimizer_apply,
             get_position_fn=get_position_fn,
             update_data_fn=update_data_fn,
             record_param_l1_norm=record_param_l1_norm,
             apply_pmap=apply_pmap,
         )
-        optimizer_state = initialize_optax_optimizer(
+        optax_optimizer_state = initialize_optax_optimizer(
             descent_optimizer, params, apply_pmap=apply_pmap
         )
-
+        optimizer_state = WarmSROptimizerState(opt_state=optax_optimizer_state,
+                        prev_eloc=None,
+                        prev_O=None,
+                        prev_U=None,
+                        prev_X=None,
+                        )
         return update_param_fn, optimizer_state
 
 from sklearn.utils.extmath import randomized_svd
 import math
+import jax
+import jax.numpy as jnp
+from jax.flatten_util import ravel_pytree
+import chex
+from typing import Tuple, Optional
+
+import jax
+import jax.numpy as jnp
+from jax.flatten_util import ravel_pytree
+import chex
+from typing import Tuple, Optional
+
+
 def get_svd_step(
     log_psi_apply: ModelApply[P],
     damping: chex.Scalar = 0.001,
     mu: chex.Scalar = 0.95,
     srft_rank: int = 500,
 ):
-    """Get the SVD update function."""
-    kernel_fn = nt.empirical_kernel_fn(log_psi_apply, vmap_axes=0, trace_axes=())
+    """Get the SVD-based natural gradient update function."""
+
+    def flatten_batch_gradients(params_grad, nchains):
+        flat_example, unravel_fn = ravel_pytree(jax.tree_map(lambda x: x[0], params_grad))
+        flat_grads = []
+        for i in range(nchains):
+            sample_i = jax.tree_map(lambda x: x[i], params_grad)
+            flat_i, _ = ravel_pytree(sample_i)
+            flat_grads.append(flat_i)
+        return jnp.stack(flat_grads).T, unravel_fn  # shape: (n_params, nchains)
 
     def svd_step(
-        centered_energies: P,
-        params: P,
-        prev_eloc,
-        prev_O,
-        prev_X,
-        positions: Array,
-    ) -> Tuple[Array, P]:
+        centered_energies: Array,     # shape: (nchains,)
+        params: P,                    # current model parameters
+        params_grad: P,               # PyTree of shape [nchains, ...] per leaf
+        prev_eloc: Optional[Array],   # previous energy target vector
+        prev_O: Optional[Array],      # previous projection matrix (n_params, r)
+        prev_X: Optional[Array],      # previous low-rank init matrix
+        positions: Array,             # shape: (nchains, ...)
+    ) -> Tuple[P, int, Array, Array, Array, Array]:
+
         nchains = positions.shape[0]
 
-        O = kernel_fn(positions, positions, "ntk", params) / nchains
-        O = O - jnp.mean(T, axis=0, keepdims=True)
-        O = O - jnp.mean(T, axis=1, keepdims=True)
-        epsilon_bar = centered_energies / jnp.sqrt(nchains)
+        # Step 1: flatten per-sample grads
+        grads_flat, unravel_fn = flatten_batch_gradients(params_grad, nchains)  # (n_params, nchains)
+        O = grads_flat
+        # Step 2: center O
+        O = O - jnp.mean(O, axis=1, keepdims=True)
+        O = O - jnp.mean(O, axis=0, keepdims=True)
 
-        oa = jnp.hstack([jnp.sqrt(mu) * prev_O, jnp.sqrt(1-mu) * O.T])
-        ea = jnp.concatenate([jnp.sqrt(mu) * prev_eloc, jnp.sqrt(1-mu) * epsilon_bar], axis=0)
+        # Step 3: center local energy
+        epsilon_bar = centered_energies / jnp.sqrt(nchains)  # shape: (nchains,)
 
-        O_rank = min(srft_rank, oa.shape[1])
-        if i == 1:
-            U, S, V = lmsvd(oa, O_rank, maxit=300, X=prev_X)
+        # Step 4: memory-augmented matrix (oa, ea)
+        if prev_O is None:
+            oa = O
+            ea = epsilon_bar
         else:
-            U, S, V = ssisvd(oa, O_rank, maxit=10, X=prev_X)
+            oa = jnp.hstack([jnp.sqrt(mu) * prev_O, jnp.sqrt(1 - mu) * O])  # (n_params, r + nchains)
+            ea = jnp.concatenate([jnp.sqrt(mu) * prev_eloc, jnp.sqrt(1 - mu) * epsilon_bar], axis=0)
 
+        # Step 5: low-rank SVD
+        O_rank = min(srft_rank, oa.shape[1])
+
+        if prev_X is None:
+            U, S, V, X = lmsvd(oa, O_rank, maxit=300, X=None)
+        else:
+            U, S, V, X = ssisvd(oa, O_rank, maxit=10, X=prev_X)
+
+        # Step 6: Truncate with damping
         ratio = S / S[0]
         ind = ratio > damping
         sigma0 = 1.0 / ((damping * jnp.abs(S[0]))**2)
-        U_trunc = U[:, :ind]
-        S_trunc = S[:ind]
-        V_trunc = V[:, :ind]
-        f = oa.T @ ea
-        uf = U_trunc.T @ f        # shape: (ind, 1)
-        uf = uf * ((1.0 / (S_trunc**2)).reshape(-1, 1) - sigma0)
-        dw_tot = U_trunc @ uf + sigma0 * f  # shape: (nchains, 1)
+
+        U_trunc = U[:, ind]
+        S_trunc = S[ind]
+        V_trunc = V[:, ind]
+
+        # Step 7: Compute parameter-space update
+        f = oa @ ea
+        uf = U_trunc.T @ f
+        uf = uf * ((1.0 / (S_trunc**2)) - sigma0)
+        dw_tot = U_trunc @ uf + sigma0 * f  # shape: (n_params,)
+
+        # Step 8: Update memory terms
         prev_O = U_trunc @ jnp.diag(S_trunc)
         prev_eloc = V_trunc.T @ ea
-        return dw_tot, len(ind), prev_eloc, prev_O, U
+
+        # Step 9: Return update as PyTree
+        update_tree = unravel_fn(dw_tot / jnp.sqrt(nchains))
+
+        return update_tree, len(S_trunc), prev_eloc, prev_O, U, X
 
     return svd_step
 
@@ -222,7 +299,7 @@ def ssisvd(A, r, X=None, maxit=10):
     S = r_diag[sorted_indices].copy()
     V = QY[:, sorted_indices].copy()
 
-    return U, S, V
+    return U, S, V, X
 
 
 import numpy as np
@@ -244,7 +321,7 @@ def lmsvd(A, r, X=None, tol=1e-8, maxit=10, memo=3):
     Y = A.T.dot(X)
     X, Y = lm_lbo(A, X, Y, r, tol, maxit, memo)
     U, S, V = get_svd(X, Y)
-    return U[:, :r].copy(), S[:r].copy(), V[:, :r].copy()
+    return U[:, :r].copy(), S[:r].copy(), V[:, :r].copy(), X
 
 def get_svd(X, Y):
     Q, R = np.linalg.qr(Y)
@@ -354,3 +431,29 @@ def lm_lbo(A, X, Y, r, tol, maxit, memo):
         rvr = D[-r:].copy()
         chg_rvr = np.linalg.norm(rvr - rvr0) / np.linalg.norm(rvr)
     return X, Y
+
+
+from vmcnet.utils.pytree_helpers import (
+    multiply_tree_by_scalar,
+    tree_inner_product,
+    tree_reduce_l1,
+)
+from vmcnet.utils.distribute import pmean_if_pmap
+
+
+def constrain_norm(
+    grad: P,
+    norm_constraint: chex.Numeric = 0.001,
+) -> P:
+    """Euclidean norm constraint."""
+    sq_norm_scaled_grads = tree_inner_product(grad, grad)
+
+    # Sync the norms here, see:
+    # https://github.com/deepmind/deepmind-research/blob/30799687edb1abca4953aec507be87ebe63e432d/kfac_ferminet_alpha/optimizer.py#L585
+    sq_norm_scaled_grads = pmean_if_pmap(sq_norm_scaled_grads)
+
+    norm_scale_factor = jnp.sqrt(norm_constraint / sq_norm_scaled_grads)
+    coefficient = jnp.minimum(norm_scale_factor, 1)
+    constrained_grads = multiply_tree_by_scalar(grad, coefficient)
+
+    return constrained_grads

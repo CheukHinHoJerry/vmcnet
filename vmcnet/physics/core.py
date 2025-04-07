@@ -153,6 +153,93 @@ def get_clipped_energies_and_stats(
     return energy, local_energies, energy_stats
 
 
+def create_value_local_value_and_grad_energy_fn(
+    log_psi_apply: ModelApply[P],
+    local_energy_fn: LocalEnergyApply[P],
+    nchains: int,
+    clipping_fn: Optional[ClippingFn] = None,
+    nan_safe: bool = True,
+) -> ValueGradEnergyFn[P]:
+    """Create a function which computes unbiased energy gradients.
+
+    Due to the Hermiticity of the Hamiltonian, we can get an unbiased lower variance
+    estimate of the gradient of the expected energy than the naive gradient of the
+    mean of sampled local energies. Specifically, the gradient of the expected energy
+    expect[E_L] takes the form
+
+        2 * expect[(E_L - expect[E_L]) * (grad_psi / psi)(x)],
+
+    where E_L is the local energy and expect[] denotes the expectation with respect to
+    the distribution |psi|^2.
+
+    Args:
+        log_psi_apply (Callable): computes log|psi(x)|, where the signature of this
+            function is (params, x) -> log|psi(x)|
+        local_energy_fn (Callable): computes local energies Hpsi / psi. Has signature
+            (params, x) -> (Hpsi / psi)(x)
+        nchains (int): total number of chains across all devices, used to compute a
+            sample variance estimate of the local energy
+        clipping_fn (Callable, optional): post-processing function on the local energy,
+            e.g. a function which clips the values to be within some multiple of the
+            total variation from the median. The post-processed values are used for
+            the gradient calculation, if available. Defaults to None.
+        nan_safe (bool, optional): flag which controls if jnp.nanmean and jnp.nansum are
+            used instead of jnp.mean and jnp.sum for the terms in the gradient
+            calculation. Can be set to False when debugging if trying to find the source
+            of unexpected nans. Defaults to True.
+
+    Returns:
+        Callable: function which computes the clipped energy value and gradient. Has the
+        signature
+            (params, x)
+            -> ((expected_energy, auxiliary_energy_data), grad_energy),
+        where auxiliary_energy_data is the tuple
+        (expected_variance, local_energies, unclipped_energy, unclipped_variance, centered_local_energies)
+    """
+    mean_grad_fn = utils.distribute.get_mean_over_first_axis_fn(nan_safe=nan_safe)
+
+    def standard_estimator_forward(
+        params: P,
+        positions: Array,
+        centered_local_energies: Array,
+    ) -> ArrayLike:
+        log_psi = log_psi_apply(params, positions)
+        kfac_jax.register_normal_predictive_distribution(log_psi[:, None])
+        # NOTE: for the generic gradient estimator case it may be important to include
+        # the (nchains / nchains -1) factor here to make sure the standard and generic
+        # gradient terms aren't mismatched by a slight scale factor.
+        return (
+            2.0
+            * nchains
+            / (nchains - 1)
+            * mean_grad_fn(centered_local_energies * log_psi)
+        )
+
+    def get_standard_contribution(local_energies_noclip, params, positions):
+        energy, local_energies, stats = get_clipped_energies_and_stats(
+            local_energies_noclip, nchains, clipping_fn, nan_safe
+        )
+        if len(local_energies.shape)==2:
+            local_energies = local_energies[:,0]
+        centered_local_energies = local_energies - energy
+        grad_E = jax.grad(standard_estimator_forward, argnums=0)(
+            params, positions, centered_local_energies
+        )
+        return energy, centered_local_energies, stats, grad_E
+
+    def energy_val_and_grad(params, positions):
+        local_energies_noclip = jax.vmap(
+            local_energy_fn, in_axes=(None, 0), out_axes=0
+        )(params, positions)
+
+        energy, centered_local_energies, stats, grad_E = get_standard_contribution(
+            local_energies_noclip, params, positions
+        )
+
+        return energy, centered_local_energies, stats, grad_E
+
+    return energy_val_and_grad
+
 def create_value_and_grad_energy_fn(
     log_psi_apply: ModelApply[P],
     local_energy_fn: LocalEnergyApply[P],

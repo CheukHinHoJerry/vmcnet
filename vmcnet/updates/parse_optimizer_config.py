@@ -25,7 +25,7 @@ from .optax_utils import (
 from .spring import initialize_spring
 from .kfac import initialize_kfac
 from .gauss_newton import initialize_gauss_newton
-
+from .warmsr import initialize_warmsr
 
 def _get_learning_rate_schedule(
     optimizer_config: ConfigDict,
@@ -69,7 +69,34 @@ def initialize_optimizer(
         vmc_config.optimizer[vmc_config.optimizer_type]
     )
 
-    if vmc_config.optimizer_type == "kfac":
+    if vmc_config.optimizer_type == "warmsr":
+        energy_and_statistics_fn = physics.core.create_energy_and_statistics_fn(
+            local_energy_fn, vmc_config.nchains, clipping_fn, vmc_config.nan_safe
+        )
+        energy_data_val_and_grad = physics.core.create_value_local_value_and_grad_energy_fn(
+            log_psi_apply,
+            local_energy_fn,
+            vmc_config.nchains,
+            clipping_fn,
+            nan_safe=vmc_config.nan_safe,
+        )
+        (
+            update_param_fn,
+            optimizer_state,
+        ) = initialize_warmsr(
+            log_psi_apply,
+            energy_and_statistics_fn,
+            energy_data_val_and_grad,
+            params,
+            get_position_fn,
+            update_data_fn,
+            learning_rate_schedule,
+            vmc_config.optimizer.warmsr,
+            vmc_config.record_param_l1_norm,
+            apply_pmap=apply_pmap,
+        )
+        return update_param_fn, optimizer_state, key
+    elif vmc_config.optimizer_type == "kfac":
         energy_data_val_and_grad = physics.core.create_value_and_grad_energy_fn(
             log_psi_apply,
             local_energy_fn,
