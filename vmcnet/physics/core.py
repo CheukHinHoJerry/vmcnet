@@ -198,7 +198,7 @@ def create_value_local_value_and_grad_energy_fn(
     """
     mean_grad_fn = utils.distribute.get_mean_over_first_axis_fn(nan_safe=nan_safe)
 
-    def standard_estimator_forward(
+    def standard_estimator_forward_full(
         params: P,
         positions: Array,
         centered_local_energies: Array,
@@ -208,11 +208,12 @@ def create_value_local_value_and_grad_energy_fn(
         # NOTE: for the generic gradient estimator case it may be important to include
         # the (nchains / nchains -1) factor here to make sure the standard and generic
         # gradient terms aren't mismatched by a slight scale factor.
+        
         return (
             2.0
             * nchains
             / (nchains - 1)
-            * mean_grad_fn(centered_local_energies * log_psi)
+            * centered_local_energies * log_psi
         )
 
     def get_standard_contribution(local_energies_noclip, params, positions):
@@ -222,21 +223,24 @@ def create_value_local_value_and_grad_energy_fn(
         if len(local_energies.shape)==2:
             local_energies = local_energies[:,0]
         centered_local_energies = local_energies - energy
-        grad_E = jax.grad(standard_estimator_forward, argnums=0)(
-            params, positions, centered_local_energies
-        )
-        return energy, centered_local_energies, stats, grad_E
+        # grad_E = jax.grad(standard_estimator_forward_full, argnums=0)(
+        #     params, positions, centered_local_energies
+        # )
+        grad_Eall = jax.jacobian(standard_estimator_forward_full, argnums=0)(
+            params, positions, centered_local_energies)
+        grad_E = jax.tree_map(jnp.nanmean, grad_Eall)
+        return energy, centered_local_energies, stats, grad_E, grad_Eall
 
     def energy_val_and_grad(params, positions):
         local_energies_noclip = jax.vmap(
             local_energy_fn, in_axes=(None, 0), out_axes=0
         )(params, positions)
 
-        energy, centered_local_energies, stats, grad_E = get_standard_contribution(
+        energy, centered_local_energies, stats, grad_E, grad_Eall = get_standard_contribution(
             local_energies_noclip, params, positions
         )
 
-        return energy, centered_local_energies, stats, grad_E
+        return energy, centered_local_energies, stats, grad_E, grad_Eall
 
     return energy_val_and_grad
 

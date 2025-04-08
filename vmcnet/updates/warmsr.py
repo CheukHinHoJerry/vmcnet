@@ -65,11 +65,11 @@ def construct_svd_update_param_fn(
 
     def update_param_fn(params, data, optimizer_state, key):
         position = get_position_fn(data)
-        energy, centered_local_energies, stats, params_grad = energy_data_val_and_grad(params, position)
+        energy, centered_local_energies, stats, params_grad, params_grad_all = energy_data_val_and_grad(params, position)
         params, optimizer_state = optimizer_apply(
             centered_local_energies,
             params,
-            params_grad,
+            params_grad_all,
             optimizer_state,
             data,
         )
@@ -113,14 +113,14 @@ def initialize_warmsr(
             learning_rate=learning_rate_schedule, momentum=0, nesterov=False
         )
 
-        def optimizer_apply(centered_local_energies, params, params_grad, optimizer_state, data):
+        def optimizer_apply(centered_local_energies, params, params_grad_all, optimizer_state, data):
             # local_energies = local_energies.reshape(-1)
             # centered_local_energies = local_energies - energy
 
             grad, _, new_prev_eloc, new_prev_O, new_prev_U, new_prev_X = warmsr_step(
                 centered_local_energies,
                 params,
-                params_grad,
+                params_grad_all,
                 optimizer_state.prev_eloc,
                 optimizer_state.prev_O,
                 optimizer_state.prev_X,
@@ -180,55 +180,10 @@ def get_svd_step(
     mu: chex.Scalar = 0.95,
     srft_rank: int = 500,
 ):
-    
-    def flatten_batch_gradients(params_grad):
-        """
-        Flattens per-chain gradient PyTrees into a 2D array of shape (n_params, nchains)
-        without using a Python loop.
-        
-        Args:
-            params_grad: PyTree where each leaf has shape (nchains, ...)
-
-        Returns:
-            flat_grads.T: jnp.ndarray of shape (n_params, nchains)
-            unravel_fn: function to reconstruct the PyTree
-        """
-        # Get number of chains from the first leaf
-        nchains = next(iter(jax.tree_util.tree_leaves(params_grad))).shape[0]
-
-        # Get unravel_fn by using a single example
-        single_example = jax.tree_map(lambda x: x[0], params_grad)
-        _, unravel_fn = ravel_pytree(single_example)
-
-        # Flatten all chains by mapping over axis 0
-        def flatten_sample(i):
-            sample_i = jax.tree_map(lambda x: x[i], params_grad)
-            flat, _ = ravel_pytree(sample_i)
-            return flat
-
-        flat_grads = jax.vmap(flatten_sample)(jnp.arange(nchains))  # (nchains, n_params)
-        
-        return flat_grads.T, unravel_fn  # shape: (n_params, nchains)
-
-
-    # def flatten_batch_gradients(params_grad, nchains):
-    #     # Get unravel function using the first element of the batch
-    #     flat_example, unravel_fn = ravel_pytree(jax.tree_map(lambda x: x[0], params_grad))
-
-    #     # Define a function that flattens one sample
-    #     def flatten_one(p):
-    #         flat, _ = ravel_pytree(p)
-    #         return flat
-
-    #     # Vectorize across chains (i.e. batch dimension)
-    #     flat_grads = jax.vmap(flatten_one)(params_grad)  # shape: (nchains, n_params)
-
-    #     return flat_grads.T, unravel_fn  # shape: (n_params, nchains)
-
     def svd_step(
         centered_energies: Array,     # shape: (nchains,)
         params: P,                    # current model parameters
-        params_grad: P,               # PyTree of shape [nchains, ...] per leaf
+        params_grad_all: P,               # PyTree of shape [nchains, ...] per leaf
         prev_eloc: Optional[Array],   # previous energy target vector
         prev_O: Optional[Array],      # previous projection matrix (n_params, r)
         prev_X: Optional[Array],      # previous low-rank init matrix
@@ -238,11 +193,11 @@ def get_svd_step(
         nchains = positions.shape[0]
 
         # Step 1: flatten per-sample grads
-        # === fix this
-        grads_flat, unravel_fn = flatten_batch_gradients(params_grad, nchains)  # (n_params, nchains)
-        # ====
+        grads_flat, tree_struct = jax.tree_util.tree_flatten(params_grad_all)
+        params_shape_list = [g.shape[1:] for g in grads_flat]
+        grads_flat = jnp.concatenate([g.reshape(g.shape[0], -1) for g in grads_flat], axis=-1)  # shape: (n_params, nchains)    
         
-        O = grads_flat
+        O = grads_flat # (nchaines, n_params)
         # Step 2: center O
         O = O - jnp.mean(O, axis=1, keepdims=True)
         O = O - jnp.mean(O, axis=0, keepdims=True)
@@ -252,10 +207,10 @@ def get_svd_step(
 
         # Step 4: memory-augmented matrix (oa, ea)
         if prev_O is None:
-            oa = O
+            oa = O.T
             ea = epsilon_bar
         else:
-            oa = jnp.hstack([jnp.sqrt(mu) * prev_O, jnp.sqrt(1 - mu) * O])  # (n_params, r + nchains)
+            oa = jnp.hstack([jnp.sqrt(mu) * prev_O.T, jnp.sqrt(1 - mu) * O.T])  # (n_params, r + nchains)
             ea = jnp.concatenate([jnp.sqrt(mu) * prev_eloc, jnp.sqrt(1 - mu) * epsilon_bar], axis=0)
 
         # Step 5: low-rank SVD
@@ -280,15 +235,23 @@ def get_svd_step(
         uf = U_trunc.T @ f
         uf = uf * ((1.0 / (S_trunc**2)) - sigma0)
         dw_tot = U_trunc @ uf + sigma0 * f  # shape: (n_params,)
-
+        dw_tot = dw_tot / jnp.sqrt(nchains)
         # Step 8: Update memory terms
         prev_O = U_trunc @ jnp.diag(S_trunc)
         prev_eloc = V_trunc.T @ ea
 
         # Step 9: Return update as PyTree
-        update_tree = unravel_fn(dw_tot / jnp.sqrt(nchains))
+        count_params = 0
+        tmp_params_list = []
+        for param_shape in params_shape_list:
+            param_size = np.prod(param_shape)
+            tmp_params_list.append(dw_tot[count_params:count_params + param_size].reshape(param_shape))
+            count_params += param_size
 
-        return update_tree, len(S_trunc), prev_eloc, prev_O, U, X
+        update_tree = jax.tree_util.tree_unflatten(tree_struct, tmp_params_list)
+        #update_tree = unravel_fn(dw_tot / jnp.sqrt(nchains))
+
+        return update_tree, len(S_trunc), prev_eloc, prev_O.T, U, X
 
     return svd_step
 
