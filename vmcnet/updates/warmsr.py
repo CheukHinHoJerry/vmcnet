@@ -170,26 +170,60 @@ def initialize_warmsr(
                         )
         return update_param_fn, optimizer_state
 
+from jax.flatten_util import ravel_pytree
+import jax
+import jax.numpy as jnp
+
 def get_svd_step(
     log_psi_apply: ModelApply[P],
     damping: chex.Scalar = 0.001,
     mu: chex.Scalar = 0.95,
     srft_rank: int = 500,
 ):
-    """Get the SVD-based natural gradient update function."""
-    def flatten_batch_gradients(params_grad, nchains):
-        # Get unravel function using the first element of the batch
-        flat_example, unravel_fn = ravel_pytree(jax.tree_map(lambda x: x[0], params_grad))
+    
+    def flatten_batch_gradients(params_grad):
+        """
+        Flattens per-chain gradient PyTrees into a 2D array of shape (n_params, nchains)
+        without using a Python loop.
+        
+        Args:
+            params_grad: PyTree where each leaf has shape (nchains, ...)
 
-        # Define a function that flattens one sample
-        def flatten_one(p):
-            flat, _ = ravel_pytree(p)
+        Returns:
+            flat_grads.T: jnp.ndarray of shape (n_params, nchains)
+            unravel_fn: function to reconstruct the PyTree
+        """
+        # Get number of chains from the first leaf
+        nchains = next(iter(jax.tree_util.tree_leaves(params_grad))).shape[0]
+
+        # Get unravel_fn by using a single example
+        single_example = jax.tree_map(lambda x: x[0], params_grad)
+        _, unravel_fn = ravel_pytree(single_example)
+
+        # Flatten all chains by mapping over axis 0
+        def flatten_sample(i):
+            sample_i = jax.tree_map(lambda x: x[i], params_grad)
+            flat, _ = ravel_pytree(sample_i)
             return flat
 
-        # Vectorize across chains (i.e. batch dimension)
-        flat_grads = jax.vmap(flatten_one)(params_grad)  # shape: (nchains, n_params)
-
+        flat_grads = jax.vmap(flatten_sample)(jnp.arange(nchains))  # (nchains, n_params)
+        
         return flat_grads.T, unravel_fn  # shape: (n_params, nchains)
+
+
+    # def flatten_batch_gradients(params_grad, nchains):
+    #     # Get unravel function using the first element of the batch
+    #     flat_example, unravel_fn = ravel_pytree(jax.tree_map(lambda x: x[0], params_grad))
+
+    #     # Define a function that flattens one sample
+    #     def flatten_one(p):
+    #         flat, _ = ravel_pytree(p)
+    #         return flat
+
+    #     # Vectorize across chains (i.e. batch dimension)
+    #     flat_grads = jax.vmap(flatten_one)(params_grad)  # shape: (nchains, n_params)
+
+    #     return flat_grads.T, unravel_fn  # shape: (n_params, nchains)
 
     def svd_step(
         centered_energies: Array,     # shape: (nchains,)
@@ -207,7 +241,7 @@ def get_svd_step(
         # === fix this
         grads_flat, unravel_fn = flatten_batch_gradients(params_grad, nchains)  # (n_params, nchains)
         # ====
-
+        
         O = grads_flat
         # Step 2: center O
         O = O - jnp.mean(O, axis=1, keepdims=True)
