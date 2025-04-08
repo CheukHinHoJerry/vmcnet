@@ -177,15 +177,19 @@ def get_svd_step(
     srft_rank: int = 500,
 ):
     """Get the SVD-based natural gradient update function."""
-
     def flatten_batch_gradients(params_grad, nchains):
+        # Get unravel function using the first element of the batch
         flat_example, unravel_fn = ravel_pytree(jax.tree_map(lambda x: x[0], params_grad))
-        flat_grads = []
-        for i in range(nchains):
-            sample_i = jax.tree_map(lambda x: x[i], params_grad)
-            flat_i, _ = ravel_pytree(sample_i)
-            flat_grads.append(flat_i)
-        return jnp.stack(flat_grads).T, unravel_fn  # shape: (n_params, nchains)
+
+        # Define a function that flattens one sample
+        def flatten_one(p):
+            flat, _ = ravel_pytree(p)
+            return flat
+
+        # Vectorize across chains (i.e. batch dimension)
+        flat_grads = jax.vmap(flatten_one)(params_grad)  # shape: (nchains, n_params)
+
+        return flat_grads.T, unravel_fn  # shape: (n_params, nchains)
 
     def svd_step(
         centered_energies: Array,     # shape: (nchains,)
@@ -200,7 +204,10 @@ def get_svd_step(
         nchains = positions.shape[0]
 
         # Step 1: flatten per-sample grads
+        # === fix this
         grads_flat, unravel_fn = flatten_batch_gradients(params_grad, nchains)  # (n_params, nchains)
+        # ====
+
         O = grads_flat
         # Step 2: center O
         O = O - jnp.mean(O, axis=1, keepdims=True)
