@@ -31,7 +31,8 @@ def make_traced_fn_with_single_metrics(
 ) -> UpdateParamFn[P, D, S]:
     """Wrap an update_param_fn to return only the first replica's metrics."""
     if not apply_pmap:
-        return jax.jit(update_param_fn)
+        #return jax.jit(update_param_fn)
+        return update_param_fn
 
     pmapped_update_param_fn = utils.distribute.pmap(update_param_fn)
 
