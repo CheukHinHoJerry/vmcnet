@@ -206,6 +206,7 @@ def _get_mcmc_fns(
     mcmc.metropolis.BurningStep[P, dwpa.DWPAData],
     mcmc.metropolis.WalkerFn[P, dwpa.DWPAData],
 ]:
+    
     metrop_step_fn = dwpa.make_dynamic_pos_amp_gaussian_step(
         log_psi_apply,
         run_config.nmoves_per_width_update,
@@ -494,6 +495,8 @@ def _burn_and_run_vmc(
         data, key = mcmc.metropolis.burn_data(
             burning_step, run_config.nburn, params, data, key
         )
+    print("finished burn in")
+    print("is pmapped :", is_pmapped)
     return train.vmc.vmc_loop(
         params,
         optimizer_state,
@@ -546,13 +549,13 @@ def run_molecule() -> None:
             ", new optimizer state" if reload_config.new_optimizer_state else "",
         )
 
-    wandb.login()
-    wandb.init(
-        project=config.wandb.project,
-        name=config.wandb.name,
-        group=config.wandb.group,
-        config=config,
-    )
+    # wandb.login()
+    # wandb.init(
+    #     project=config.wandb.project,
+    #     name=config.wandb.name,
+    #     group=config.wandb.group,
+    #     config=config,
+    # )
 
     root_logger = logging.getLogger()
     root_logger.setLevel(config.logging_level)
@@ -623,7 +626,6 @@ def run_molecule() -> None:
             start_epoch = reload_at_epoch
 
     logging.info("Saving to %s", logdir)
-
     params, optimizer_state, data, key, nans_detected = _burn_and_run_vmc(
         config.vmc,
         logdir,
